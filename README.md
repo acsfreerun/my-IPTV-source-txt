@@ -1,5 +1,4 @@
-# my-IPTV-source-txt
-我的直播源 TXT 合集
+# 我的直播源 TXT 合集
 
 
 # 酷九使用 GitHub TXT 列表订阅教程
@@ -14,7 +13,7 @@
 
 #### 方法 1：手动拼接（核心逻辑）
 ghproxy 加速链接的格式为：  
-`https://ghproxy.com/` + **Raw 原始链接**  
+`https://ghfast.top/` + **Raw 原始链接**  
 
 示例：
 - 原始 Raw 链接：`https://raw.githubusercontent.com/acsfreerun/my-IPTV-source-txt/main/iptv-source.txt`
