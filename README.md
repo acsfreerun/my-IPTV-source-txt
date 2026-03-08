@@ -15,10 +15,6 @@
 ghproxy 加速链接的格式为：  
 `https://ghfast.top/` + **Raw 原始链接**  
 
-示例：
-- 原始 Raw 链接：`https://raw.githubusercontent.com/acsfreerun/my-IPTV-source-txt/main/iptv-source.txt`
-- 转换后 ghproxy 链接：`https://ghproxy.com/https://raw.githubusercontent.com/acsfreerun/my-IPTV-source-txt/main/iptv-source.txt`
-
 #### 方法 2：一键转换工具（懒人版）
 使用在线工具快速转换，无需手动拼接：
 1. 打开 ghproxy 官方转换页：https://ghproxy.com/
