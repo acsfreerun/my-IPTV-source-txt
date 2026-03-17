@@ -33,5 +33,5 @@ ghproxy 加速链接的格式为：
    - ✅ TXT 文件格式是否符合要求（推荐格式：`频道名,播放链接,分类`，每行一个）。
 
 ## 链接直接复制版本
-- 广东联通酒店：    https://ghfast.top/https://raw.githubusercontent.com/acsfreerun/my-IPTV-source-txt/refs/heads/main/%E5%B9%BF%E4%B8%9C%E8%81%94%E9%80%9A%20%E9%85%92%E5%BA%97%E6%BA%90.txt
 - 韭菜专用：   https://ghfast.top/https://raw.githubusercontent.com/acsfreerun/my-IPTV-source-txt/refs/heads/main/%E9%9F%AD%E8%8F%9C%E4%B8%93%E7%94%A8.txt
+- 酒店源：   https://ghfast.top/https://raw.githubusercontent.com/acsfreerun/my-IPTV-source-txt/refs/heads/main/%E5%B9%BF%E4%B8%9C%E8%81%94%E9%80%9A%20%E9%85%92%E5%BA%97%E6%BA%90.txt
