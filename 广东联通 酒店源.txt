@@ -185,3 +185,11 @@ CCTV风云足球,http://61.178.227.57:9901/tsfile/live/1017_1.m3u8?key=txiptv
 深圳都市,http://120.233.73.4:19901/tsfile/live/1037_1.m3u8?key=txiptv
 深圳少儿,http://120.233.73.4:19901/tsfile/live/1035_1.m3u8?key=txiptv
 深圳电视剧,http://120.233.73.4:19901/tsfile/live/1036_1.m3u8?key=txiptv
+
+港澳频道,#genre#
+翡翠台,http://zgxsd.f3322.net:9901/tsfile/live/1034_1.m3u8?key=txiptv
+明珠台,http://zgxsd.f3322.net:9901/tsfile/live/1035_1.m3u8?key=txiptv
+翡翠台(HD),http://live.alicdn.com/tmall/bc54432a-b1db-4ce0-a407-50f836dd5e2b.m3u8 
+J2,http://live.alicdn.com/tmall/e70b243a-e21c-4ce1-b157-b6dc7bd75661.m3u8 
+明珠台,http://live.alicdn.com/tmall/12aad6be-bb7f-49eb-9998-47531372564e.m3u8 
+无线新闻台,http://live.alicdn.com/tmall/2f1e580e-0268-e3e4-e0a8-3ee4cc5a9b7f.m3u8 
