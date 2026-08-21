@@ -461,8 +461,12 @@ class Spider(Spider):
 
             if isinstance(data, dict) and data.get('url'):
                 video_url = str(data['url']).replace('\\/', '/')
+                # 播放地址是 .mp3 伪后缀（实际为 video/mp4）。
+                # FongMi/TVBox 对 parse:0 直链会按 .mp3 扩展名误判为音频导致"无有效播放地址"，
+                # 故改用 parse:1 走嗅探：FongMi 会实际请求该 url 并按响应 content-type(video/mp4)识别。
+                # header 带上防盗链 Referer/Origin，保证嗅探请求不被 403。
                 return {
-                    'parse': 0,
+                    'parse': 1,
                     'url': video_url,
                     'header': self.play_headers,
                     'Header': self.play_headers,
