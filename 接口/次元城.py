@@ -462,17 +462,15 @@ class Spider(Spider):
 
             if isinstance(data, dict) and data.get('url'):
                 video_url = str(data['url']).replace('\\/', '/')
-                # 播放地址是 .mp3 伪后缀（实际为 video/mp4）。
-                # FongMi/TVBox 会按 .mp3 扩展名误判为音频导致"无有效播放地址"。
-                # 故改用本地代理 localProxy：把真实地址 base64 编码后以 proxy:// 返回，
-                # 由 localProxy 带防盗链头流式转发真实视频流，并强制 Content-Type: video/mp4，
-                # 这样 FongMi 看到的是正常视频流，可正常播放且支持拖动进度。
-                proxy_url = 'proxy://' + base64.urlsafe_b64encode(video_url.encode('utf-8')).decode('ascii')
+                # 播放地址是 .mp3 伪后缀（实际为 video/mp4），webhtv/FongMi 会按
+                # .mp3 扩展名误判为音频导致"无有效播放地址"。
+                # 故返回本地代理地址（getProxyUrl + path 参数），由 localProxy 带
+                # 防盗链头请求真实视频并强制 Content-Type: video/mp4。
+                # 返回格式遵循 webhtv 播放约定：playUrl + url + header。
                 return {
-                    'parse': 0,
-                    'url': proxy_url,
+                    'playUrl': '',
+                    'url': self.getProxyUrl(local=False) + '&path=' + quote(video_url),
                     'header': {},
-                    'Header': {},
                 }
             return {'parse': 1, 'url': '', 'header': self.play_headers}
         except Exception as e:
@@ -484,39 +482,40 @@ class Spider(Spider):
 
     # ==================== 本地代理 ====================
     def localProxy(self, param):
-        """把 .mp3 伪后缀的真实视频流转发给播放器。
+        """把 .mp3 伪后缀的真实视频代理给播放器（webhtv 约定）。
 
-        dr_py 约定：playerContent 返回 url 以 proxy:// 开头时，框架会把
-        proxy:// 之后的参数传给本方法，返回 [status, content-type, data]，
-        data 可为 bytes / 字符串 / 可迭代对象（生成器，用于流式大视频）。
+        webhtv 的 Java 端会把 URL 的 query 参数序列化成 JSON 字符串传给本方法：
+        app.callAttr("localProxy", obj, gson.toJson(params))，返回 list：
+        [status_code, content_type, body, headers, is_base64]。
+        注意：body 需为 bytes（webhtv 用 ByteArrayInputStream 全量加载，不支持生成器）。
         """
-        def gen():
-            # 生成器必须在流内请求真实视频，边拉边发给播放器
-            try:
-                resp = requests.get(real_url, headers=stream_headers, stream=True, timeout=30)
-                if resp.status_code != 200:
-                    return
-                for chunk in resp.iter_content(chunk_size=128 * 1024):
-                    if chunk:
-                        yield chunk
-            except Exception:
-                return
-
         try:
             if not param:
-                return [500, 'text/plain', b'bad proxy param']
-            tok = param
-            if tok.startswith('proxy://'):
-                tok = tok[len('proxy://'):]
-            real_url = base64.urlsafe_b64decode(tok.encode('ascii')).decode('utf-8')
-            stream_headers = dict(self.play_headers)
-            return [200, 'video/mp4', gen()]
+                return [500, 'text/plain', b'bad proxy param', {}, 0]
+            # param 是 JSON 字符串（由 query 参数 Map 序列化而来），解析出 path
+            try:
+                jo = json.loads(param) if isinstance(param, str) else (param or {})
+            except Exception:
+                jo = {}
+            real_url = (jo.get('path') or '') if isinstance(jo, dict) else ''
+            if not real_url:
+                # 兼容：param 可能是纯 url 字符串
+                real_url = param
+            real_url = urllib.parse.unquote(str(real_url))
+            if not real_url.startswith('http'):
+                return [500, 'text/plain', b'bad path', {}, 0]
+
+            headers = dict(self.play_headers)
+            resp = requests.get(real_url, headers=headers, timeout=30)
+            if resp.status_code != 200:
+                return [resp.status_code, 'text/plain', b'fetch failed', {}, 0]
+            return [200, 'video/mp4', resp.content, {}, 0]
         except Exception as e:
             try:
                 self.log("LocalProxy error: %s" % e)
             except Exception:
                 pass
-            return [500, 'text/plain', b'proxy error']
+            return [500, 'text/plain', b'proxy error', {}, 0]
 
     # ==================== 占位方法 ====================
     def isVideoFormat(self, url):
