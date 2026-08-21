@@ -1,423 +1,489 @@
-#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-源名称：次元城动画 (cycani.org)
-生成方式：AI 自动生成
-站点类型：现代 SPA + 自研 JSON API（需登录获取播放地址）
-适配环境：py-drpy / TVBox / 影视仓
-登录机制：每次调用前自动检查登录态，未登录则用内置账号密码自动登录
-"""
+# 次元城动画（cycani.org）采集源
+# 架构：React SPA + JSON API（/api 前缀，统一 {code,msg,data} 响应）
+# 播放需登录 token：从 extend 或 vipFlags 传入，默认见 DEFAULT_TOKEN
+# token 过期后会自动用账号密码登录续期（见 DEFAULT_USERNAME / DEFAULT_PASSWORD），
+# 若登录也失败，请登录网站 F12 抓任意 Authorization: Bearer xxx 请求替换 token，
+# 或在配置源 extend / vipFlags 里填入 {"username":"xx","password":"yy"} 覆盖默认账号。
 
+import sys
 import re
 import json
+import base64
 import time
-import requests
+import html as html_mod
+import urllib.parse
+from urllib.parse import quote
+
+sys.path.append('..')
 from base.spider import Spider
 
 
 class Spider(Spider):
-    # ==================== 基础配置 ====================
-    name = "次元城动画"
-    base_url = "https://www.cycani.org"
-    site_url = "https://www.cycani.org"
-    api_prefix = "/api"
 
-    # ==================== 登录配置（请填写你的账号密码） ====================
-    # 注意：该站点用户名是 acsfreee（3 个 e），不是 acsfree
-    USERNAME = "acsfreee"
-    PASSWORD = "zxc123qwe"
+    # 默认登录 token（会过期，播放失败会自动登录续期）
+    DEFAULT_TOKEN = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1c2VyX2lkIjoxNDY1MzA5LCJ1c2VybmFtZSI6ImFjc2ZyZWVlIiwidG9rZW5faWQiOiIwMUtaVEVCTTEwRTlHR0hHQlRSNFpUMkdKNSIsInRva2VuX3ZlcnNpb24iOjEsImlzcyI6Imh0dHA6Ly9sb2NhbGhvc3Q6ODA5MCIsImF1ZCI6WyIiXSwiZXhwIjoxNzg3MTI0OTI5LCJuYmYiOjE3ODY1MjAxMjksImlhdCI6MTc4NjUyMDEyOX0.3_s-n68PMi4unDW_aJNLRmmmteQN8V9e9IYfSP64KJA"
 
-    # ==================== 分类映射（zone_id） ====================
-    class_name = ["TV番组", "剧场番组"]
-    class_url = ["1", "2"]
+    # 默认登录账号密码：token 过期后自动调用 /auth/login 重新登录（登录接口 POST /auth/login）
+    DEFAULT_USERNAME = "acsfreee"
+    DEFAULT_PASSWORD = "zxc123qwe"
 
-    # ==================== 请求头常量 ====================
-    APP_NAME = "cyc_web"      # X-App-Name
-    APP_VERSION = "cycweb"    # X-App-Version
-    page_size = 20
+    def init(self, extend=""):
+        self.host = "https://www.cycani.org"
+        self.api = self.host + "/api"
+        self.headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+            'Accept': 'application/json',
+            'X-App-Name': 'cyc_web',
+            'X-Time-Zone': 'Asia/Shanghai',
+            'X-App-Version': 'cycweb',
+            'Referer': self.host + '/',
+            'Origin': self.host,
+        }
+        # 播放专用头（防盗链）
+        self.play_headers = {
+            'User-Agent': self.headers['User-Agent'],
+            'Referer': self.host + '/',
+            'Origin': self.host,
+        }
+        # 登录信息：extend 支持 "xxx"（纯token）、{"token":"xxx"}、
+        # {"username":"xx","password":"yy"} 或 {"token":"xxx","username":"xx","password":"yy"}
+        self.username = self.DEFAULT_USERNAME
+        self.password = self.DEFAULT_PASSWORD
+        self.token = self._parse_token(extend) or self.DEFAULT_TOKEN
+        ext_cred = self._parse_cred(extend)
+        if ext_cred:
+            self.username = ext_cred[0] or self.username
+            self.password = ext_cred[1] or self.password
+        # 分区：次元城只有 TV番组 / 剧场番组
+        self.classes = [
+            {"type_id": "1", "type_name": "TV番组"},
+            {"type_id": "2", "type_name": "剧场番组"},
+        ]
+        self.page_size = 24
 
-    def __init__(self):
-        # 登录态：token 与过期时间戳（秒）
-        self._token = None
-        self._token_expiry = 0
+    def getName(self):
+        return "次元城动画"
 
-        self._session = requests.Session()
-        self._session.headers.update({
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36",
-            "Accept": "application/json",
-            "X-App-Name": self.APP_NAME,
-            "X-App-Version": self.APP_VERSION,
-            "X-Time-Zone": "Asia/Shanghai",
-            "Origin": self.base_url,
-            "Referer": self.base_url + "/",
-        })
+    # ==================== 工具函数 ====================
+    def _parse_token(self, extend):
+        if not extend:
+            return ""
+        ext = str(extend).strip()
+        if ext.startswith('{'):
+            try:
+                j = json.loads(ext)
+                return j.get('token', '') or ''
+            except Exception:
+                return ext
+        return ext
 
-    # ==================== 工具函数层 ====================
-
-    def _build_headers(self):
-        """构建请求头，已登录则附带 Authorization"""
-        h = dict(self._session.headers)
-        if self._token:
-            h["Authorization"] = "Bearer " + self._token
-        return h
-
-    def _api(self, path):
-        """拼接完整 API URL"""
-        prefix = self.api_prefix
-        if not prefix.startswith("/"):
-            prefix = "/" + prefix
-        return self.base_url + prefix + path
-
-    # ==================== 自动登录 ====================
-
-    def _ensure_login(self):
-        """检查登录态，未登录或已过期则自动登录。返回是否可用。"""
-        if self._token and time.time() < self._token_expiry - 60:
-            return True
-        return self._login()
-
-    def _login(self):
-        """执行登录，保存 token 与过期时间。返回是否成功。"""
+    def _parse_cred(self, extend):
+        """从 extend 解析 (username, password)，非 JSON 或缺少字段时返回 None"""
+        if not extend:
+            return None
+        ext = str(extend).strip()
+        if not ext.startswith('{'):
+            return None
         try:
-            url = self._api("/auth/login")
-            data = {"username": self.USERNAME, "password": self.PASSWORD}
-            resp = self._session.post(url, json=data, headers=self._build_headers(), timeout=15)
-            js = resp.json()
-            if resp.status_code == 200 and js.get("code") == 0:
-                d = js.get("data") or {}
-                token = d.get("token") or ""
-                # token 可能自带 "Bearer " 前缀，去掉以便统一加前缀
-                if token.startswith("Bearer "):
-                    token = token[7:]
-                self._token = token
-                # expires_at 可能为 ISO 字符串或时间戳，统一换算成绝对时间戳
-                expires_at = d.get("expires_at")
-                self._token_expiry = self._parse_expiry(expires_at)
-                return bool(self._token)
-            else:
-                print(f"[{self.name}] 登录失败: {js.get('msg')} (请检查账号密码)")
-                return False
-        except Exception as e:
-            print(f"[{self.name}] 登录异常: {e}")
-            return False
-
-    def _parse_expiry(self, expires_at):
-        """解析过期时间，返回绝对时间戳(秒)。兼容时间戳、ISO 字符串、带时区偏移 ISO"""
-        if not expires_at:
-            return time.time() + 3600
-        try:
-            if isinstance(expires_at, (int, float)):
-                # 可能是毫秒
-                if expires_at > 1e12:
-                    expires_at = expires_at / 1000
-                return float(expires_at)
-            s = str(expires_at).strip()
-            # 去尾时区偏移（如 +08:00）和末尾 Z，再去小数秒
-            if s.endswith("Z"):
-                s = s[:-1]
-            else:
-                s = re.sub(r"(\+|\-)\d{2}:\d{2}$", "", s)
-            if "." in s:
-                s = s.split(".")[0]
-            ts = time.mktime(time.strptime(s, "%Y-%m-%dT%H:%M:%S"))
-            return ts
+            j = json.loads(ext)
         except Exception:
-            return time.time() + 3600
+            return None
+        if not isinstance(j, dict):
+            return None
+        u = str(j.get('username', '') or '').strip()
+        p = str(j.get('password', '') or '')
+        if u and p:
+            return (u, p)
+        return None
 
-    # ==================== 请求封装 ====================
+    def clean(self, text):
+        if not text:
+            return ""
+        text = html_mod.unescape(str(text))
+        text = re.sub(r'<[^>]+>', '', text)
+        text = re.sub(r'[\x00-\x1f\x7f]', '', text)
+        text = re.sub(r'\s+', ' ', text)
+        return text.strip()
 
-    def _get_json(self, path, params=None, need_auth=False):
-        """GET JSON，need_auth=True 时先确保已登录"""
+    def normalize_pic(self, src):
+        if not src:
+            return ""
+        if src.startswith('//'):
+            return 'https:' + src
+        if src.startswith('http'):
+            return src
+        if src.startswith('/'):
+            return self.host + src
+        return src
+
+    def fetch_page(self, url, headers=None, timeout=15):
         try:
-            if need_auth and not self._ensure_login():
-                return None
-            resp = self._session.get(
-                self._api(path),
-                params=params,
-                headers=self._build_headers(),
-                timeout=15,
-            )
-            js = resp.json()
-            return js.get("data") if js.get("code") == 0 else None
+            resp = self.fetch(url, headers=headers or self.headers, timeout=timeout)
+            if hasattr(resp, 'text'):
+                return resp.text
+            return str(resp)
         except Exception as e:
-            print(f"[{self.name}] GET 异常 {path}: {e}")
+            try:
+                self.log("Fetch error: %s" % e)
+            except Exception:
+                pass
+            return ""
+
+    def api_get(self, path, params=None, auth=False, token=None, post=False, body=None):
+        """请求 /api 接口，返回完整响应 dict（含 code/msg/data），失败返回 None"""
+        url = self.api + path
+        if params:
+            url += '?' + urllib.parse.urlencode(params)
+        headers = dict(self.headers)
+        if auth:
+            tok = token or self.token
+            if tok:
+                headers['Authorization'] = 'Bearer ' + tok
+        if post:
+            headers['Content-Type'] = 'application/json'
+            data = json.dumps(body) if body is not None else '{}'
+            text = self.post_page(url, headers=headers, data=data)
+        else:
+            text = self.fetch_page(url, headers=headers)
+        if not text:
+            return None
+        try:
+            obj = json.loads(text)
+        except Exception:
+            return None
+        if not isinstance(obj, dict):
+            return None
+        return obj
+
+    def api_data(self, path, params=None, auth=False, token=None, post=False, body=None):
+        """请求并解出 data 字段（code==0 才返回 data，否则 None）"""
+        obj = self.api_get(path, params=params, auth=auth, token=token, post=post, body=body)
+        if obj and obj.get('code') == 0:
+            return obj.get('data')
+        return None
+
+    def post_page(self, url, headers=None, data=None, timeout=15):
+        """POST 请求"""
+        try:
+            resp = self.fetch(url, headers=headers or self.headers, data=data, timeout=timeout)
+            if hasattr(resp, 'text'):
+                return resp.text
+            return str(resp)
+        except Exception as e:
+            try:
+                self.log("Post error: %s" % e)
+            except Exception:
+                pass
+            return ""
+
+    # ==================== token 自动续期 ====================
+    def _jwt_exp(self, token):
+        """解析 JWT 的 exp 字段，返回剩余秒数（解析失败返回 None）"""
+        try:
+            tok = token
+            if tok.startswith('Bearer '):
+                tok = tok[7:]
+            parts = tok.split('.')
+            if len(parts) < 2:
+                return None
+            payload = parts[1]
+            payload += '=' * (-len(payload) % 4)
+            obj = json.loads(base64.urlsafe_b64decode(payload).decode('utf-8'))
+            exp = obj.get('exp')
+            if not exp:
+                return None
+            return int(exp) - int(time.time())
+        except Exception:
             return None
 
-    # ==================== 数据标准化 ====================
+    def _login(self, username=None, password=None):
+        """用账号密码登录获取新 token，返回裸 token（去掉 Bearer 前缀），失败返回 None"""
+        u = username or self.username
+        p = password or self.password
+        if not u or not p:
+            return None
+        obj = self.api_get('/auth/login', auth=False, post=True, body={
+            'username': u,
+            'password': p,
+        })
+        if not obj or obj.get('code') != 0:
+            try:
+                self.log("Login failed (code=%s)" % (obj.get('code') if obj else 'None'))
+            except Exception:
+                pass
+            return None
+        data = obj.get('data') or {}
+        new_tok = data.get('token') or ''
+        if new_tok.startswith('Bearer '):
+            new_tok = new_tok[7:]
+        return new_tok or None
 
-    def _build_vod_item(self, v):
-        """标准化影片列表条目（视频列表/搜索/推荐通用）"""
-        vod_id = v.get("video_id") or v.get("id") or ""
-        vod_name = v.get("title") or ""
-        vod_pic = v.get("cover_url") or ""
-        vod_remarks = v.get("remarks") or ""
-        vod_year = str(v.get("year") or "")
-        vod_area = v.get("area") or ""
-        vod_score = str(v.get("score") or "") if v.get("score") else ""
-        # 标签拼到类型
-        tags = v.get("tags") or []
-        vod_type = "、".join(str(x) for x in tags) if tags else (v.get("version") or "")
+    def _refresh_token(self, token):
+        """用旧 token 换新 token；refresh 失效时回退到账号密码登录。返回新 token（失败返回 None）"""
+        obj = self.api_get('/auth/refresh', auth=True, token=token, post=True, body={})
+        if obj and obj.get('code') == 0:
+            data = obj.get('data') or {}
+            new_tok = data.get('token') or ''
+            if new_tok.startswith('Bearer '):
+                new_tok = new_tok[7:]
+            if new_tok:
+                return new_tok
+        # refresh 失败（token 已彻底过期），改用账号密码登录续期
+        return self._login()
+
+    def ensure_token(self):
+        """确保 token 有效：过期或快过期则自动刷新。返回可用 token（失败返回原 token）"""
+        tok = self.token
+        if not tok:
+            return tok
+        remain = self._jwt_exp(tok)
+        # 剩余不足 1 天就刷新（防止跨 0 点后过期），解析失败也尝试刷新
+        if remain is not None and remain > 86400:
+            return tok
+        new_tok = self._refresh_token(tok)
+        if new_tok:
+            self.token = new_tok
+            try:
+                self.log("Token refreshed (remain=%s)" % self._jwt_exp(new_tok))
+            except Exception:
+                pass
+            return new_tok
+        return tok
+
+    def _build_item(self, v):
+        """标准化列表项（列表接口字段是 video_id，详情是 id）"""
+        if not v:
+            return None
+        vid = v.get('video_id') or v.get('id')
+        if vid is None:
+            return None
+        total = v.get('total')
+        remark = v.get('remarks') or ''
+        if not remark and total:
+            remark = '更新至%d集' % total
         return {
-            "vod_id": str(vod_id),
-            "vod_name": vod_name,
-            "vod_pic": vod_pic,
-            "vod_remarks": vod_remarks,
-            "vod_year": vod_year,
-            "vod_area": vod_area,
-            "vod_type": vod_type,
-            "vod_score": vod_score,
+            'vod_id': str(vid),
+            'vod_name': self.clean(v.get('title', '')),
+            'vod_pic': self.normalize_pic(v.get('cover_url', '')),
+            'vod_remarks': self.clean(remark),
         }
 
-    # ==================== 五大核心方法 ====================
-
-    def homeContent(self, filter=False):
-        """首页：返回分类 + 推荐番剧"""
-        result = {"class": [], "list": []}
-        # 分类
-        for i, n in enumerate(self.class_name):
-            result["class"].append({"type_id": self.class_url[i], "type_name": n})
-        # 推荐内容
-        try:
-            data = self._get_json("/index/recommend")
-            if data and data.get("list"):
-                seen = set()
-                for section in data["list"]:
-                    for v in (section.get("videos") or []):
-                        vid = str(v.get("video_id") or "")
-                        if vid and vid not in seen:
-                            seen.add(vid)
-                            item = self._build_vod_item(v)
-                            if item["vod_id"]:
-                                result["list"].append(item)
-        except Exception as e:
-            print(f"[{self.name}] 首页异常: {e}")
-        return result
-
-    def categoryContent(self, tid, pg, filter=False, extend=None):
-        """分类列表（分页）"""
+    # ==================== 首页 ====================
+    def homeContent(self, filter):
         result = {
-            "list": [],
-            "page": pg,
-            "pagecount": 0,
-            "limit": self.page_size,
-            "total": 0,
+            'class': self.classes,
+            'filters': {},
+            'list': [],
         }
-        try:
-            params = {
-                "zone_id": str(tid),
-                "page": str(pg),
-                "page_size": str(self.page_size),
-            }
-            # 支持年份/类型筛选
-            if extend:
-                if extend.get("year"):
-                    params["year"] = str(extend["year"])
-                if extend.get("category"):
-                    params["category"] = str(extend["category"])
-            data = self._get_json("/videos", params=params)
-            if data and data.get("list"):
-                for v in data["list"]:
-                    item = self._build_vod_item(v)
-                    if item["vod_id"]:
-                        result["list"].append(item)
-                pager = data.get("pager") or {}
-                result["pagecount"] = self._calc_pagecount(pager)
-                result["total"] = pager.get("total") or len(result["list"])
-        except Exception as e:
-            print(f"[{self.name}] 分类异常: {e}")
+        data = self.api_data('/index/recommend')
+        if isinstance(data, dict):
+            vods = []
+            sections = data.get('list', []) if isinstance(data.get('list'), list) else []
+            for sec in sections:
+                for v in (sec.get('videos') or []):
+                    item = self._build_item(v)
+                    if item:
+                        vods.append(item)
+            result['list'] = vods[:30]
         return result
 
-    def _calc_pagecount(self, pager):
-        try:
-            total = pager.get("total") or 0
-            return (total + self.page_size - 1) // self.page_size
-        except Exception:
-            return 1
+    def homeVideoContent(self):
+        data = self.api_data('/index/recommend')
+        vods = []
+        if isinstance(data, dict):
+            sections = data.get('list', []) if isinstance(data.get('list'), list) else []
+            for sec in sections:
+                for v in (sec.get('videos') or []):
+                    item = self._build_item(v)
+                    if item:
+                        vods.append(item)
+        return {'list': vods[:30]}
 
-    def detailContent(self, ids):
-        """影片详情（含选集）"""
-        result = []
-        vod_id = ids if isinstance(ids, str) else (ids[0] if ids else "")
-        if not vod_id:
-            return result
-        try:
-            data = self._get_json("/videos/" + str(vod_id))
-            if not data:
-                return result
+    # ==================== 分类 ====================
+    def categoryContent(self, tid, pg, filter, extend):
+        pg = int(pg) if str(pg).isdigit() and int(pg) > 0 else 1
+        tid = str(tid)
+        page_size = self.page_size
+        data = self.api_data('/videos', params={
+            'zone_id': tid,
+            'page': pg,
+            'page_size': page_size,
+        })
+        vods = []
+        total = 0
+        if isinstance(data, dict):
+            for v in (data.get('list') or []):
+                item = self._build_item(v)
+                if item:
+                    vods.append(item)
+            pager = data.get('pager') or {}
+            total = int(pager.get('total') or 0)
+        pagecount = (total + page_size - 1) // page_size if total else 1
+        return {
+            'list': vods,
+            'page': pg,
+            'pagecount': pagecount,
+            'limit': page_size,
+            'total': total,
+        }
 
-            vod = {
-                "vod_id": str(data.get("id") or vod_id),
-                "vod_name": data.get("title") or "",
-                "vod_pic": data.get("cover_url") or "",
-                "vod_year": str(data.get("year") or ""),
-                "vod_area": data.get("area") or "",
-                "vod_score": str(data.get("score") or "") if data.get("score") else "",
-                "vod_remarks": data.get("remarks") or "",
-                "vod_director": "、".join(data.get("director") or []),
-                "vod_actor": "、".join(data.get("actor") or []),
-                "vod_type": "、".join(data.get("tags") or []),
-                "vod_content": (data.get("description") or "").replace("\r\n", "\n"),
-            }
-
-            # 播放线路（play_from）
-            play_from = data.get("play_from") or []
-            line_names = []
-            line_sections = []
-            if play_from:
-                for pf in play_from:
-                    code = pf.get("code")
-                    title = pf.get("title") or "默认线路"
-                    if not code:
-                        continue
-                    sections = self._get_sections(vod_id, code)
-                    line_names.append(title)
-                    line_sections.append(sections)
-            # 兜底：无 play_from 时尝试常见线路
-            if not line_names:
-                code = "cychub"
-                sections = self._get_sections(vod_id, code)
-                if sections:
-                    line_names.append("CYC_Main")
-                    line_sections.append(sections)
-
-            line_urls = []
-            for sec in line_sections:
-                parts = []
-                for s in sec:
-                    ep_title = s.get("title") or f"第{len(parts)+1}集"
-                    parts.append(f"{ep_title}${s['id']}")
-                line_urls.append("#".join(parts))
-
-            vod["vod_play_from"] = "$$$".join(line_names)
-            vod["vod_play_url"] = "$$$".join(line_urls)
-            result.append(vod)
-        except Exception as e:
-            print(f"[{self.name}] 详情异常: {e}")
-        return result
-
-    def _get_sections(self, video_id, player_code):
-        """获取某线路的全部选集"""
-        sections = []
-        page = 1
-        try:
-            while page <= 10:
-                params = {
-                    "player_code": player_code,
-                    "page": str(page),
-                    "page_size": str(100),
-                }
-                data = self._get_json(f"/videos/{video_id}/sections", params=params)
-                if not data or not data.get("list"):
-                    break
-                sections.extend(data["list"])
-                pager = data.get("pager") or {}
-                total = pager.get("total") or len(sections)
-                if len(sections) >= total:
-                    break
-                page += 1
-        except Exception as e:
-            print(f"[{self.name}] 选集异常: {e}")
-        return sections
-
-    def playerContent(self, flag, id, vipFlags=""):
-        """播放地址解析：用选集 id 换取真实播放地址（需登录）"""
-        try:
-            section_id = str(id).split("$")[0].strip()
-            if not section_id:
-                return {"parse": 0, "url": "", "header": {}}
-            # 直接是播放链接则原样返回
-            if ".m3u8" in section_id or ".mp4" in section_id or ".mpd" in section_id:
-                return {
-                    "parse": 0,
-                    "url": section_id,
-                    "header": {"User-Agent": self._session.headers["User-Agent"]},
-                }
-            data = self._get_json(
-                f"/v2/sections/{section_id}/play-url",
-                need_auth=True,
-            )
-            if data and data.get("url"):
-                return {
-                    "parse": 0,
-                    "url": data["url"],
-                    "header": {"User-Agent": self._session.headers["User-Agent"]},
-                }
-            return {"parse": 0, "url": "", "header": {}}
-        except Exception as e:
-            print(f"[{self.name}] 播放异常: {e}")
-            return {"parse": 0, "url": "", "header": {}}
-
+    # ==================== 搜索 ====================
     def searchContent(self, key, quick, pg="1"):
-        """关键词搜索"""
-        result = {
-            "list": [],
-            "page": int(pg),
-            "pagecount": 0,
-            "limit": self.page_size,
-            "total": 0,
+        pg = int(pg) if str(pg).isdigit() and int(pg) > 0 else 1
+        page_size = self.page_size
+        wd = self.clean(key)
+        data = self.api_data('/videos/search', params={
+            'q': wd,
+            'page': pg,
+            'page_size': page_size,
+        })
+        vods = []
+        total = 0
+        if isinstance(data, dict):
+            for v in (data.get('list') or []):
+                item = self._build_item(v)
+                if item:
+                    vods.append(item)
+            pager = data.get('pager') or {}
+            total = int(pager.get('total') or 0)
+        pagecount = (total + page_size - 1) // page_size if total else 1
+        return {
+            'list': vods,
+            'page': pg,
+            'pagecount': pagecount,
+            'limit': page_size,
+            'total': total,
         }
-        if not key:
-            return result
+
+    # ==================== 详情 ====================
+    def detailContent(self, ids):
+        vid = str(ids[0]) if isinstance(ids, list) else str(ids)
+        data = self.api_data('/videos/' + vid)
+        if not isinstance(data, dict):
+            return {'list': []}
+
+        vod = {
+            'vod_id': vid,
+            'vod_name': '',
+            'vod_pic': '',
+            'vod_year': '',
+            'vod_area': '',
+            'vod_actor': '',
+            'vod_director': '',
+            'vod_remarks': '',
+            'vod_content': '',
+            'vod_score': '',
+            'vod_play_from': '',
+            'vod_play_url': '',
+        }
+        vod['vod_name'] = self.clean(data.get('title', ''))
+        vod['vod_pic'] = self.normalize_pic(data.get('cover_url', ''))
+        vod['vod_year'] = str(data.get('year') or '')
+        vod['vod_area'] = self.clean(data.get('area', ''))
+        vod['vod_remarks'] = self.clean(data.get('remarks', ''))
+        vod['vod_content'] = self.clean(data.get('description', ''))
+        if data.get('score') is not None:
+            vod['vod_score'] = str(data.get('score'))
+
+        actor = data.get('actor') or []
+        if isinstance(actor, list):
+            vod['vod_actor'] = ', '.join(self.clean(a) for a in actor)
+        director = data.get('director') or []
+        if isinstance(director, list):
+            vod['vod_director'] = ', '.join(self.clean(d) for d in director)
+
+        # ---- 播放线路与选集 ----
+        play_from = data.get('play_from') or []
+        play_from_list = []
+        play_url_list = []
+        for line in play_from:
+            code = line.get('code') or ''
+            name = self.clean(line.get('title', '')) or '默认线路'
+            eps = self._fetch_sections(vid, code)
+            parts = []
+            for i, ep in enumerate(eps):
+                ep_id = ep.get('id')
+                ep_title = self.clean(ep.get('title', '')) or ('第%d集' % (i + 1))
+                if ep_id is not None:
+                    parts.append('%s$%s' % (ep_title, ep_id))
+            if parts:
+                play_from_list.append(name)
+                play_url_list.append('#'.join(parts))
+
+        vod['vod_play_from'] = '$$$'.join(play_from_list)
+        vod['vod_play_url'] = '$$$'.join(play_url_list)
+        return {'list': [vod]}
+
+    def _fetch_sections(self, vid, player_code):
+        """循环翻页拉取全部选集（服务端 page_size 上限约 100）"""
+        eps = []
+        page = 1
+        page_size = 100
+        while True:
+            data = self.api_data('/videos/%s/sections' % vid, params={
+                'player_code': player_code,
+                'page': page,
+                'page_size': page_size,
+            })
+            if not isinstance(data, dict):
+                break
+            lst = data.get('list') or []
+            eps.extend(lst)
+            pager = data.get('pager') or {}
+            total = int(pager.get('total') or 0)
+            if not lst or page * page_size >= total:
+                break
+            page += 1
+        return eps
+
+    # ==================== 播放 ====================
+    def playerContent(self, flag, id, vipFlags):
         try:
-            params = {
-                "q": str(key),
-                "page": str(pg),
-                "page_size": str(self.page_size),
-            }
-            data = self._get_json("/videos/search", params=params)
-            if data and data.get("list"):
-                for v in data["list"]:
-                    item = self._build_vod_item(v)
-                    if item["vod_id"]:
-                        result["list"].append(item)
-                pager = data.get("pager") or {}
-                result["pagecount"] = self._calc_pagecount(pager)
-                result["total"] = pager.get("total") or len(result["list"])
+            section_id = str(id or '').strip()
+            # token 优先取 vipFlags，其次 init 里的 extend
+            token = self._parse_token(vipFlags) or self.token
+
+            # 快过期时先刷新 token
+            token = self.ensure_token() if token == self.token else token
+
+            path = '/v2/sections/%s/play-url' % section_id
+            obj = self.api_get(path, auth=True, token=token)
+            data = obj.get('data') if obj else None
+
+            # 401 说明 token 失效，尝试刷新后重试一次
+            if obj and obj.get('code') == 401:
+                new_tok = self._refresh_token(token)
+                if new_tok:
+                    self.token = new_tok
+                    obj = self.api_get(path, auth=True, token=new_tok)
+                    data = obj.get('data') if obj else None
+
+            if isinstance(data, dict) and data.get('url'):
+                video_url = str(data['url']).replace('\\/', '/')
+                return {
+                    'parse': 0,
+                    'url': video_url,
+                    'header': self.play_headers,
+                    'Header': self.play_headers,
+                }
+            return {'parse': 1, 'url': '', 'header': self.play_headers}
         except Exception as e:
-            print(f"[{self.name}] 搜索异常: {e}")
-        return result
+            try:
+                self.log("Play error: %s" % e)
+            except Exception:
+                pass
+            return {'parse': 1, 'url': '', 'header': self.play_headers}
+
+    # ==================== 占位方法 ====================
+    def isVideoFormat(self, url):
+        pass
+
+    def manualVideoCheck(self):
+        pass
 
     def localProxy(self, param):
-        return []
+        pass
 
-    # ==================== 手动测试入口 ====================
-    def _self_test(self):
-        """本地自检（不走 TVBox 框架）"""
-        print("== 登录测试 ==")
-        ok = self._ensure_login()
-        print("登录结果:", ok, "| token:", (self._token[:20] + "...") if self._token else None)
-        print("\n== 首页 ==")
-        home = self.homeContent()
-        print("分类:", [(c["type_id"], c["type_name"]) for c in home.get("class", [])])
-        print("推荐数:", len(home.get("list", [])))
-        if home.get("list"):
-            print("首条:", home["list"][0]["vod_name"], home["list"][0]["vod_id"])
-        print("\n== 分类(zone=1) ==")
-        cat = self.categoryContent("1", "1")
-        print("条数:", len(cat.get("list", [])), "| total:", cat.get("total"))
-        if cat.get("list"):
-            print("首条:", cat["list"][0]["vod_name"], "id=", cat["list"][0]["vod_id"])
-            vid = cat["list"][0]["vod_id"]
-            print("\n== 详情 ==")
-            d = self.detailContent([vid])
-            if d:
-                vod = d[0]
-                print("片名:", vod["vod_name"])
-                print("线路:", vod.get("vod_play_from"))
-                print("选集数:", len(vod.get("vod_play_url", "").split("#")) if vod.get("vod_play_url") else 0)
-                print("前2集:", vod.get("vod_play_url", "").split("#")[:2])
-                first_sec = vod.get("vod_play_url", "").split("#")[0].split("$")[-1] if vod.get("vod_play_url") else ""
-                if first_sec:
-                    print("\n== 播放 ==")
-                    pl = self.playerContent("", first_sec)
-                    print("播放地址:", pl.get("url"))
-        print("\n== 搜索『无职』 ==")
-        sres = self.searchContent("无职", "1", "1")
-        print("搜索数:", len(sres.get("list", [])))
-        if sres.get("list"):
-            print("首条:", sres["list"][0]["vod_name"])
-
-
-if __name__ == "__main__":
-    sp = Spider()
-    sp._self_test()
+    def liveContent(self, url):
+        pass
