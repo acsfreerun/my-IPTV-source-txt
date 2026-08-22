@@ -85,11 +85,13 @@ async function apiReq(path, params, auth, tok, post, body) {
     }
     const headers = baseHeaders();
     if (auth && tok) headers['Authorization'] = 'Bearer ' + stripBearer(tok);
-    const opt = { headers };
+    const opt = { headers, timeout: 15000 };
     if (post) {
         opt.method = 'POST';
-        headers['Content-Type'] = 'application/json';
-        opt.data = JSON.stringify(body || {});
+        // 注意：cat.js / FongMi quickjs 的 req() 要求 data 传【对象】，
+        // 框架(getJsonBody)会自动 JSON 序列化并设 Content-Type: application/json。
+        // 千万不要传 JSON.stringify 后的字符串（会被框架二次加引号导致登录失败）。
+        opt.data = (body !== undefined && body !== null) ? body : {};
     }
     try {
         const res = await req(url, opt);
@@ -458,6 +460,20 @@ async function proxy(params) {
     }
 }
 
+// 框架扩展：真实地址是 .mp3 伪后缀的 MP4（CDN 返回 video/mp4），
+// 主动告知框架这是视频，避免按扩展名误判走嗅探
+function isVideo(url) {
+    if (!url) return false;
+    const u = String(url);
+    if (u.indexOf('/proxy?do=js') >= 0) return true;   // 本源代理地址
+    if (u.indexOf('cycr2.top') > 0 || u.indexOf('cycani.org') > 0) return true; // 本站资源
+    return /\.(mp4|m3u8|flv|mkv|avi|mov|webm|ts|mp3)(\?|#|$)/i.test(u);
+}
+
+function sniffer() {
+    return false;
+}
+
 export function __jsEvalReturn() {
     return {
         init,
@@ -467,6 +483,8 @@ export function __jsEvalReturn() {
         detail,
         search,
         play,
-        proxy
+        proxy,
+        isVideo,
+        sniffer
     };
 }
