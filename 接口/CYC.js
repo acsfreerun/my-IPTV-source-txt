@@ -1,11 +1,4 @@
-/**
-    title: "次元城动画",
-    author: "",
-    logo: "https://www.cycani.org/favicon.ico",
-    more: {
-        sourceTag: "在线动漫"
-    }
-*/
+
 import { Crypto, load, _ } from 'assets://js/lib/cat.js';
 
 let HOST = 'https://www.cycani.org';
