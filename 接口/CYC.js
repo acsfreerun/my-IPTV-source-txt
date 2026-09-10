@@ -18,6 +18,16 @@ const CLASSES = [
     { type_id: "2", type_name: "剧场番组" }
 ];
 
+// /api/video-zones 里混入的提示性文本，不是真实题材，需剔除
+const TAG_PLACEHOLDERS = ['分类资源不代表全部资源'];
+
+// 排序维度：/api/videos 的 order_by 参数
+const ORDER_OPTIONS = [
+    { n: '更新时间', v: 'update_time' },
+    { n: '热度', v: 'hits' },
+    { n: '评分', v: 'score' }
+];
+
 // ==================== 工具 ====================
 
 function baseHeaders() {
@@ -229,8 +239,52 @@ async function init(cfg) {
     return '';
 }
 
+// 把站点返回的字符串数组转成筛选选项（首项为“全部”=空值）
+function toFilterOptions(arr) {
+    const out = [{ n: '全部', v: '' }];
+    const seen = {};
+    for (const raw of (arr || [])) {
+        const s = String(raw === null || raw === undefined ? '' : raw).trim();
+        if (!s || seen[s] || TAG_PLACEHOLDERS.indexOf(s) >= 0) continue;
+        seen[s] = 1;
+        out.push({ n: s, v: s });
+    }
+    return out;
+}
+
+// 依据分区 filters 构建 FongMi 筛选组：[{key,name,value:[{n,v}]}]
+function buildFilterGroups(zone) {
+    const f = (zone && zone.filters) || {};
+    const groups = [];
+    const cats = toFilterOptions(f.categories);
+    if (cats.length > 1) groups.push({ key: 'tag', name: '题材', value: cats });
+    const areas = toFilterOptions(f.areas);
+    if (areas.length > 1) groups.push({ key: 'area', name: '地区', value: areas });
+    const langs = toFilterOptions(f.languages);
+    if (langs.length > 1) groups.push({ key: 'language', name: '语言', value: langs });
+    const years = toFilterOptions(f.years);
+    if (years.length > 1) groups.push({ key: 'year', name: '年份', value: years });
+    groups.push({ key: 'order_by', name: '排序', value: ORDER_OPTIONS.slice() });
+    return groups;
+}
+
 async function home(filter) {
-    return JSON.stringify({ class: CLASSES, filters: {} });
+    let classes = CLASSES;
+    let filters = {};
+    try {
+        const data = await apiData('/video-zones');
+        const zones = (data && data.list) ? data.list : [];
+        const cls = [];
+        const flt = {};
+        for (const z of zones) {
+            if (!z || z.id === undefined || z.id === null) continue;
+            const tid = String(z.id);
+            cls.push({ type_id: tid, type_name: clean(z.name || '') || ('分区' + tid) });
+            flt[tid] = buildFilterGroups(z);
+        }
+        if (cls.length) { classes = cls; filters = flt; }
+    } catch (e) {}
+    return JSON.stringify({ class: classes, filters });
 }
 
 async function fetchRecommend() {
@@ -258,8 +312,22 @@ async function category(tid, pg, filter, extend) {
     if (!page || page < 1) page = 1;
     const list = [];
     let total = 0;
+    let ext = extend;
+    if (typeof ext === 'string') {
+        try { ext = JSON.parse(ext); } catch (e) { ext = null; }
+    }
+    if (!ext || typeof ext !== 'object') ext = {};
+    const params = { zone_id: String(tid), page, page_size: PAGE_SIZE };
+    // 筛选键与 /api/videos 参数同名：tag(题材) / area(地区) / language(语言) / year(年份) / order_by(排序)
+    const FILTER_KEYS = ['tag', 'area', 'language', 'year', 'order_by'];
+    for (const k of FILTER_KEYS) {
+        const v = ext[k];
+        if (v === undefined || v === null) continue;
+        const s = String(v).trim();
+        if (s) params[k] = s;
+    }
     try {
-        const data = await apiData('/videos', { zone_id: String(tid), page, page_size: PAGE_SIZE });
+        const data = await apiData('/videos', params);
         if (data) {
             for (const v of (data.list || [])) {
                 const item = buildItem(v);
