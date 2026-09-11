@@ -5,7 +5,7 @@ let HOST = 'https://www.cycani.org';
 let token = '';                                    // 运行时自动登录获取，无需配置
 let username = 'acsfreee';                         // 默认账号，可被 ext 覆盖
 let password = 'zxc123qwe';
-let playMode = 'direct';                           // direct(默认,直连) | redirect(本地代理302) | stream(本地代理转发)
+let playMode = 'direct';                           // direct(默认,直连) | redirect(本地代理302) | stream(降级为302，禁止整集转发)
 
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
 const PAGE_SIZE = 24;
@@ -43,7 +43,32 @@ function baseHeaders() {
 }
 
 function playHeaders() {
-    return { 'User-Agent': UA, 'Referer': HOST + '/', 'Origin': HOST };
+    // CDN 无防盗链（CORS *）。Origin/Referer 会挂到每一次 Range 上，IJK/部分 Exo 会卡顿、无法拖动
+    return { 'User-Agent': UA };
+}
+
+function playFormat(url) {
+    const path = String(url || '').split('#')[0].split('?')[0].toLowerCase();
+    if (/\.m3u8?$/.test(path)) return 'application/x-mpegURL';
+    if (/\.mpd$/.test(path)) return 'application/dash+xml';
+    // 含 .mp3 伪后缀的整段 MP4：强制按视频流，避免播放器按后缀走音频
+    return 'application/octet-stream';
+}
+
+function markVideo(url) {
+    const u = String(url || '');
+    if (!u || u.indexOf('isVideo=true') >= 0) return u;
+    return u + '#isVideo=true#';
+}
+
+function playResult(url) {
+    return JSON.stringify({
+        parse: 0,
+        jx: 0,
+        url: markVideo(url),
+        header: playHeaders(),
+        format: playFormat(url)
+    });
 }
 
 function stripBearer(t) {
@@ -478,15 +503,10 @@ async function play(flag, id, flags) {
         if (data && data.url) {
             const videoUrl = String(data.url).replace(/\\\//g, '/');
             if (playMode === 'direct') {
-                // CDN 无防盗链且 Content-Type 为 video/mp4，直连即可
-                return JSON.stringify({ parse: 0, url: videoUrl, header: playHeaders() });
+                return playResult(videoUrl);
             }
-            // 代理模式：URL 追加 &ext=.mp4 兜底扩展名误判
-            return JSON.stringify({
-                parse: 0,
-                url: PROXY_BASE + 'url=' + encodeURIComponent(videoUrl) + '&ext=.mp4',
-                header: playHeaders()
-            });
+            // redirect：本地 302 + ext=.mp4，兜底播放器按后缀误判
+            return playResult(PROXY_BASE + 'url=' + encodeURIComponent(videoUrl) + '&ext=.mp4');
         }
         return fallback;
     } catch (e) {
@@ -509,26 +529,22 @@ async function proxy(params) {
             realUrl = params;
         }
         if (!realUrl.startsWith('http')) return [500, 'text/plain', 'bad proxy param'];
-        if (playMode === 'stream') {
-            const res = await req(realUrl, { headers: playHeaders(), buffer: 2 });
-            if (!res || !res.content) return [502, 'text/plain', 'fetch failed'];
-            return [200, 'video/mp4', res.content];
-        }
-        // redirect 模式：302 跳真实地址（播放器沿用 play() 返回的防盗链头）
+        // 单集 300~500MB，JS 全量转发会卡死；stream 与 redirect 一律 302
         return [302, 'text/plain', '', { 'Location': realUrl }];
     } catch (e) {
         return [500, 'text/plain', 'proxy error'];
     }
 }
 
-// 框架扩展：真实地址是 .mp3 伪后缀的 MP4（CDN 返回 video/mp4），
-// 主动告知框架这是视频，避免按扩展名误判走嗅探
+// CDN 真实地址常是 .mp3 伪后缀的 MP4（Content-Type: video/mp4），必须按视频识别
 function isVideo(url) {
     if (!url) return false;
     const u = String(url);
-    if (u.indexOf('/proxy?do=js') >= 0) return true;   // 本源代理地址
-    if (u.indexOf('cycr2.top') > 0 || u.indexOf('cycani.org') > 0) return true; // 本站资源
-    return /\.(mp4|m3u8|flv|mkv|avi|mov|webm|ts|mp3)(\?|#|$)/i.test(u);
+    if (u.indexOf('isVideo=true') >= 0) return true;
+    if (u.indexOf('/proxy?do=js') >= 0) return true;
+    if (u.indexOf('cycstream.com') >= 0) return true;
+    if (u.indexOf('cycr2.top') >= 0 || u.indexOf('cycani.org') >= 0) return true;
+    return /\.(mp4|m3u8|flv|mkv|avi|mov|webm|ts|mp3|mpd)(\?|#|$)/i.test(u);
 }
 
 function sniffer() {
