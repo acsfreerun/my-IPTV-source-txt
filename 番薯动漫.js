@@ -12,7 +12,7 @@
  *    · SafeLine：纯 JS 复现 calc.wasm（reset/arg/calc/ret），换 JWT
  *    · Cookie 会话：合并 Set-Cookie，JWT 5 分钟刷新，不丢掉 cf_clearance
  *    · 502 / 空包 / 过盾失败自动重试
- *    · ext.cookie 可手动塞 cf_clearance（家庭网多数不需要）
+ *    · 源内已写入浏览器 cf_clearance；过期后再用 ext.cookie 覆盖
  *
  *  【搜索】先走 /index.php/ajax/suggest（免验证码），
  *    HTML 搜索失败再 OCR 验证码（ext.ocr 可指定接口）。
@@ -53,6 +53,8 @@ const UA_POOL = [
 
 const cookieJar = {};
 let jwtAt = 0;
+
+const DEFAULT_COOKIE = 'Hm_tf_kp4742159xj=1768814840; showBtn=true; cf_clearance=Op9CtIoofBGGH.GQkGvgE5ugCwYple_huJSY4eoCp8Q-1789218554-1.2.1.1-fPuebKypOWBBgw2IXez5DIg3p7zuYh96fExuvIzMRxPNdcuBghlKGKZtq2Hnbd8bZFK5BVczUUPlGx_xIHc5Hm5hGT86YcNjex.lqn9sepwZAcc4Mg3L4w0tEMh5A3CjU8u8pJw0dfVgTZHuew4PdjTvHCC1eL8wMlMBHqeltjvmUGVZXdMLZ_Jt6NYPPAoPScJy2EM4w_cTAvM.jiLi3omAJAADzROA.SewMolpmVQGGQg0IiQHAqX30GJgNvKgesCm8DyAhxS_8q5ijWYIsBWMGTXB23M.rSPkYABzvylBuHt.Xy.Mducufqp8jTB9RzxWKy5KJWQP9swWJE3N61D0T3hEyeDsIAmX81mtXak3vuP76Na5X7GME68t6PVoz4wtQJh7uEJH0NW4WtvzCEFJzSa_vLh61M9CM81f77QZRhfysr0BWTKrMtjQxUPNlOqcsgJPLiWenFAgAFeYt1x2j9zUOBrUXIBO3nBQgMgq4g4rrgzGlFs7dVYR3JaIZ.Cf8wdfl_u5EI2NmeBGww; mx_style=white; Hm_lvt_kp4742159xj=1789185650,1789189032,1789205702,1789218554; PHPSESSID=hspkunf28s5c6hfbtu3g07np22; Hm_lpvt_kp4742159xj=1789218604';
 
 const FALLBACK_CLASSES = [
     { type_id: '1', type_name: 'TV番剧' },
@@ -1066,9 +1068,10 @@ async function init(cfg) {
     PARSE_HOST = 'https://ym.bjdaile.fun';
     ocrApi = '';
     jwtAt = 0;
-    UA = pickUa();
+    UA = UA_POOL[0];
     const keys = Object.keys(cookieJar);
     for (let i = 0; i < keys.length; i++) delete cookieJar[keys[i]];
+    mergeCookieString(DEFAULT_COOKIE);
     try {
         let ext = '';
         if (cfg && typeof cfg === 'object') ext = cfg.ext || '';
