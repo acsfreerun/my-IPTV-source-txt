@@ -8,12 +8,22 @@
  *  【站点形态】苹果 CMS + mxtheme，无可用 provide/app JSON
  *    分类/列表/详情/搜索全部走 HTML。
  *
+ *  【防护】可能同时遇到长亭 SafeLine 与 Cloudflare。
+ *    · SafeLine：纯 JS 复现 calc.wasm（reset/arg/calc/ret），换 JWT
+ *    · Cookie 会话：合并 Set-Cookie，JWT 5 分钟刷新，不丢掉 cf_clearance
+ *    · 502 / 空包 / 过盾失败自动重试
+ *    · ext.cookie 可手动塞 cf_clearance（家庭网多数不需要）
+ *
+ *  【搜索】先走 /index.php/ajax/suggest（免验证码），
+ *    HTML 搜索失败再 OCR 验证码（ext.ocr 可指定接口）。
+ *
  *  【播放】player_aaaa.encrypt=3，url=fsyun_...
  *    → iframe https://ym.bjdaile.fun/?url=fsyun_...
  *    → 页内 config.url 为 AES 密文；密钥由两个 meta#id 排序后
  *      MD5(material + "3G7Fh9Dp6R2QsE8w") 得到，再 AES-128-CBC 解密
  *      得到 douyinvod.com 直链 mp4。
  *
+ *  【ext】{"host":"...","parse":"...","mode":"direct","cookie":"...","ocr":"..."}
  *  【数据契约】与 CYC.js 相同
  * ═══════════════════════════════════════════════════════════════
  */
@@ -23,11 +33,26 @@ import { Crypto, load, _ } from 'assets://js/lib/cat.js';
 let HOST = 'https://www.fsdm02.com';
 let PARSE_HOST = 'https://ym.bjdaile.fun';
 let playMode = 'direct';
+let UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
+let ocrApi = '';
 
-const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
 const PAGE_SIZE = 24;
 const PROXY_BASE = 'http://127.0.0.1:9978/proxy?do=js&';
 const PARSE_SALT = '3G7Fh9Dp6R2QsE8w';
+const JWT_TTL = 5 * 60 * 1000;
+const MAX_RETRY = 4;
+const SL_ISSUE = 'https://challenge.rivers.chaitin.cn/challenge/v2/api/issue';
+const SL_VERIFY = 'https://challenge.rivers.chaitin.cn/challenge/v2/api/verify';
+const OCR_DEFAULT = 'https://api.nn.ci/ocr/b64/text';
+
+const UA_POOL = [
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36 Edg/131.0.0.0',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0'
+];
+
+const cookieJar = {};
+let jwtAt = 0;
 
 const FALLBACK_CLASSES = [
     { type_id: '1', type_name: 'TV番剧' },
@@ -122,14 +147,191 @@ function pickId(id) {
     return String(id);
 }
 
-function isCfChallenge(html) {
+function isSafeLine(html) {
     if (!html) return false;
+    const t = String(html);
+    return /SafeLineChallenge|sl-challenge|rivers\.chaitin|长亭/i.test(t);
+}
+
+function isCfChallenge(html) {
+    if (!html || isSafeLine(html)) return false;
     const t = String(html);
     return t.indexOf('Just a moment') >= 0
         || t.indexOf('请稍候') >= 0
         || t.indexOf('cf-mitigated') >= 0
         || t.indexOf('challenge-platform') >= 0
-        || t.indexOf('cdn-cgi/challenge') >= 0;
+        || t.indexOf('cdn-cgi/challenge') >= 0
+        || t.indexOf('cf-turnstile') >= 0
+        || t.indexOf('challenges.cloudflare.com') >= 0;
+}
+
+function isSearchCaptcha(html) {
+    if (!html) return false;
+    if (/voddetail\//i.test(html) && /module-(?:card|poster)-item/i.test(html)) return false;
+    return /mac_verify|verify\/index|请输入验证码/i.test(html);
+}
+
+function isSiteUrl(url) {
+    const u = String(url || '');
+    return u.indexOf(HOST) === 0 || /fsdm02\.com/i.test(u);
+}
+
+function headerOf(headers, name) {
+    if (!headers) return '';
+    const want = String(name).toLowerCase();
+    for (const k in headers) {
+        if (String(k).toLowerCase() === want) return headers[k];
+    }
+    return '';
+}
+
+function cookieHeader() {
+    const keys = Object.keys(cookieJar);
+    if (!keys.length) return '';
+    const parts = [];
+    for (let i = 0; i < keys.length; i++) {
+        parts.push(keys[i] + '=' + cookieJar[keys[i]]);
+    }
+    return parts.join('; ');
+}
+
+function setCookiePair(name, value) {
+    const k = String(name || '').trim();
+    if (!k) return;
+    const v = String(value || '').trim();
+    if (!v || v.toLowerCase() === 'deleted') delete cookieJar[k];
+    else cookieJar[k] = v;
+}
+
+function mergeCookieString(raw) {
+    const s = String(raw || '').trim();
+    if (!s) return;
+    const bits = s.split(';');
+    for (let i = 0; i < bits.length; i++) {
+        const nv = bits[i];
+        const eq = nv.indexOf('=');
+        if (eq <= 0) continue;
+        const k = nv.substring(0, eq).trim();
+        if (/^(path|domain|expires|max-age|samesite|secure|httponly)$/i.test(k)) continue;
+        setCookiePair(k, nv.substring(eq + 1));
+    }
+}
+
+function absorbSetCookie(headers) {
+    const v = headerOf(headers, 'set-cookie');
+    if (v === undefined || v === null || v === '') return;
+    const arr = Array.isArray(v) ? v : [v];
+    for (let i = 0; i < arr.length; i++) {
+        const chunks = String(arr[i] || '').split(/,(?=\s*[A-Za-z0-9_\-]+=)/);
+        for (let j = 0; j < chunks.length; j++) {
+            const nv = chunks[j].split(';')[0];
+            const eq = nv.indexOf('=');
+            if (eq <= 0) continue;
+            setCookiePair(nv.substring(0, eq), nv.substring(eq + 1));
+        }
+    }
+}
+
+function randInt(min, max) {
+    return min + Math.floor(Math.random() * (max - min + 1));
+}
+
+function randVisitorId() {
+    const chars = '0123456789abcdefghijklmnopqrstuvwxyz';
+    let out = '';
+    for (let i = 0; i < 32; i++) out += chars.charAt(Math.floor(Math.random() * chars.length));
+    return out;
+}
+
+function pickUa() {
+    return UA_POOL[Math.floor(Math.random() * UA_POOL.length)] || UA_POOL[0];
+}
+
+function imul(a, b) {
+    if (typeof Math.imul === 'function') return Math.imul(a, b);
+    a = a | 0;
+    b = b | 0;
+    const ah = (a >>> 16) & 0xffff;
+    const al = a & 0xffff;
+    const bh = (b >>> 16) & 0xffff;
+    const bl = b & 0xffff;
+    return ((al * bl) + (((ah * bl + al * bh) << 16) >>> 0)) | 0;
+}
+
+function remS(a, b) {
+    a = a | 0;
+    b = b | 0;
+    if (!b) return 0;
+    return (a - imul((a / b) | 0, b)) | 0;
+}
+
+function slCalc(args) {
+    const n = args.length | 0;
+    let sum = 0;
+    for (let i = 0; i < n; i++) sum = (sum + (args[i] | 0)) | 0;
+    const rem = remS((sum + n + 6) | 0, 6);
+    let l2 = 1;
+    let l1 = 0;
+    const exp = (rem + 6) | 0;
+    const tail = exp & 7;
+    if (rem >= 2) {
+        const times = exp & 2147483640;
+        let c = 0;
+        let last = l2;
+        while (c !== times) {
+            last = l2;
+            l2 = imul(l2, 1679616);
+            c = (c + 8) | 0;
+        }
+        l1 = imul(last, 279936);
+    }
+    if (tail) {
+        let c = 0;
+        do {
+            l1 = l2;
+            l2 = imul(l2, 6);
+            c = (c + 1) | 0;
+        } while (c !== tail);
+    }
+    l2 = imul(((l1 >>> 0) >= 1111) ? 1 : n, l2);
+    if (l2 >= 66666667 && n) l2 = (l2 / n) | 0;
+    for (let i = 0; i < n; i++) {
+        const x = args[i] | 0;
+        const cube = imul(imul(x, x), x);
+        l2 = ((x + i) ^ ((cube + l2) | 0) ^ i) | 0;
+    }
+    const stored = [];
+    if (l2 > 0) {
+        let v = l2;
+        while (true) {
+            stored.push(v & 63);
+            const more = (v >>> 0) > 63;
+            v = v >>> 6;
+            if (!more) break;
+        }
+    }
+    const out = [];
+    for (let i = stored.length - 1; i >= 0; i--) out.push(stored[i]);
+    return out;
+}
+
+function parseJson(text) {
+    if (!text) return null;
+    const s = String(text).trim();
+    if (!s) return null;
+    const startObj = s.indexOf('{');
+    const startArr = s.indexOf('[');
+    let start = -1;
+    if (startObj >= 0 && (startArr < 0 || startObj < startArr)) start = startObj;
+    else start = startArr;
+    if (start < 0) return null;
+    try { return JSON.parse(s.substring(start)); } catch (e) { return null; }
+}
+
+function unwrapData(obj) {
+    if (!obj || typeof obj !== 'object') return null;
+    if (obj.data && typeof obj.data === 'object' && !Array.isArray(obj.data)) return obj.data;
+    return obj;
 }
 
 function isVideoUrl(url) {
@@ -160,18 +362,144 @@ function normalizeRes(res) {
     return { status, headers, content };
 }
 
-async function httpGet(url, headers) {
-    try {
-        const res = normalizeRes(await req(url, {
-            headers: headers || baseHeaders(),
-            timeout: 15000
-        }));
-        const html = res.content || '';
-        if (isCfChallenge(html)) return { status: 403, content: '', blocked: true };
-        return { status: res.status || 200, content: html, blocked: false };
-    } catch (e) {
-        return { status: 0, content: '', blocked: false };
+function withSiteCookie(url, headers) {
+    const h = headers || {};
+    if (isSiteUrl(url)) {
+        const ck = cookieHeader();
+        if (ck) h['Cookie'] = ck;
     }
+    return h;
+}
+
+async function rawReq(url, opt) {
+    const option = opt || {};
+    const headers = withSiteCookie(url, option.headers || baseHeaders());
+    const reqOpt = { headers, timeout: option.timeout || 15000 };
+    if (option.method) reqOpt.method = option.method;
+    if (option.data !== undefined) reqOpt.data = option.data;
+    if (option.postType) reqOpt.postType = option.postType;
+    if (option.buffer) reqOpt.buffer = option.buffer;
+    try {
+        const res = normalizeRes(await req(url, reqOpt));
+        absorbSetCookie(res.headers);
+        return res;
+    } catch (e) {
+        return { status: 0, headers: {}, content: '' };
+    }
+}
+
+async function postJson(url, body, extraHeaders) {
+    const headers = {
+        'User-Agent': UA,
+        'Accept': 'application/json, text/plain, */*',
+        'Content-Type': 'application/json'
+    };
+    if (extraHeaders) {
+        for (const k in extraHeaders) headers[k] = extraHeaders[k];
+    }
+    let res = await rawReq(url, {
+        method: 'POST',
+        headers,
+        data: body,
+        postType: 'json'
+    });
+    if (!res.content) {
+        headers['Content-Type'] = 'application/json';
+        res = await rawReq(url, {
+            method: 'POST',
+            headers,
+            data: JSON.stringify(body),
+            postType: 'raw'
+        });
+    }
+    return res;
+}
+
+async function getJwt(seedHtml) {
+    try {
+        let html = seedHtml || '';
+        if (!isSafeLine(html)) {
+            const home = await rawReq(HOST + '/', { headers: baseHeaders() });
+            html = home.content || '';
+        }
+        if (!isSafeLine(html)) return '';
+        const idM = html.match(/SafeLineChallenge\(["']([^"']+)["']/);
+        const lvM = html.match(/SafeLineChallenge[\s\S]{0,200}?level:\s*["']?(\d+)/);
+        if (!idM) return '';
+        const clientId = idM[1];
+        const level = lvM ? parseInt(lvM[1], 10) : 1;
+        const issueRes = await postJson(SL_ISSUE, { client_id: clientId, level }, {
+            Referer: HOST + '/',
+            Origin: HOST
+        });
+        const issueObj = unwrapData(parseJson(issueRes.content));
+        if (!issueObj) return '';
+        const issueId = issueObj.issue_id;
+        let nums = issueObj.data;
+        if (nums && !Array.isArray(nums) && Array.isArray(nums.data)) nums = nums.data;
+        if (!issueId || !Array.isArray(nums)) return '';
+        const result = slCalc(nums);
+        const verifyRes = await postJson(SL_VERIFY, {
+            issue_id: issueId,
+            result,
+            serials: [],
+            client: {
+                userAgent: UA,
+                platform: 'Win32',
+                language: 'zh-CN,en,en-GB,en-US',
+                vendor: 'Google Inc.',
+                screen: [randInt(1536, 1836), randInt(864, 1164)],
+                visitorId: randVisitorId(),
+                score: 0
+            }
+        }, { Referer: HOST + '/', Origin: HOST, 'Content-Type': 'application/json' });
+        const verObj = unwrapData(parseJson(verifyRes.content));
+        const jwt = verObj && (verObj.jwt || verObj.token || '');
+        return jwt ? String(jwt) : '';
+    } catch (e) {
+        return '';
+    }
+}
+
+async function ensureJwt(html) {
+    const now = Date.now();
+    if (cookieJar['sl-challenge-jwt'] && now - jwtAt < JWT_TTL && !isSafeLine(html)) return true;
+    const jwt = await getJwt(html);
+    if (!jwt) return false;
+    cookieJar['sl-challenge-jwt'] = jwt;
+    jwtAt = now;
+    return true;
+}
+
+function looksBadGateway(html) {
+    const t = String(html || '');
+    return /502 Bad Gatewa|503 Service|504 Gateway/i.test(t);
+}
+
+async function httpGet(url, headers) {
+    const extra = (headers && typeof headers === 'object') ? headers : null;
+    let last = { status: 0, content: '', blocked: false };
+    for (let i = 0; i < MAX_RETRY; i++) {
+        const res = await rawReq(url, { headers: extra ? baseHeaders(extra) : baseHeaders() });
+        const html = res.content || '';
+        last = { status: res.status || 0, content: html, blocked: false };
+        if (isSafeLine(html)) {
+            const ok = await ensureJwt(html);
+            if (ok) continue;
+            last.blocked = true;
+            last.content = '';
+            continue;
+        }
+        if (isCfChallenge(html)) {
+            last = { status: 403, content: '', blocked: true };
+            continue;
+        }
+        if (!html || looksBadGateway(html) || (res.status >= 500 && res.status < 600)) {
+            continue;
+        }
+        return { status: res.status || 200, content: html, blocked: false };
+    }
+    return last;
 }
 
 function emptyPage(page) {
@@ -411,6 +739,7 @@ function parseListHtml(html) {
                 const name = clean(
                     a.attr('title')
                     || box.find('.module-poster-item-title, .module-card-item-title, .module-item-title, strong, h3, .title').first().text()
+                    || box.find('img').first().attr('alt')
                     || a.text()
                 );
                 const pic = attrPic(box.find('img').first()) || a.attr('data-original') || '';
@@ -427,18 +756,29 @@ function parseListHtml(html) {
     }
     if (list.length) return list;
 
-    const re = /href="([^"]*voddetail\/[^"]+)"[^>]*?(?:title="([^"]*)")?[\s\S]{0,500}?(?:data-original|data-src|src)="([^"]+)"/gi;
+    const re = /href="([^"]*\/voddetail\/[^"]+)"/gi;
     let m;
     const seen = {};
     while ((m = re.exec(html)) !== null) {
         const vid = hrefId(m[1]);
         if (!vid || seen[vid]) continue;
+        const chunk = html.substring(m.index, Math.min(html.length, m.index + 900));
+        const nameM = chunk.match(/title="([^"]+)"/)
+            || chunk.match(/alt="([^"]+)"/)
+            || chunk.match(/module-(?:poster|card)-item-title[^>]*>([^<]+)/i)
+            || chunk.match(/<strong>([^<]+)<\/strong>/i);
+        const picM = chunk.match(/data-original="([^"]+)"/)
+            || chunk.match(/data-src="([^"]+)"/)
+            || chunk.match(/\ssrc="([^"]+)"/);
+        const remarkM = chunk.match(/module-item-note[^>]*>([^<]+)/i);
+        const name = clean((nameM && nameM[1]) || '');
+        if (!name) continue;
         seen[vid] = 1;
         list.push({
             vod_id: vid,
-            vod_name: clean(m[2] || ''),
-            vod_pic: normalizePic(m[3] || ''),
-            vod_remarks: ''
+            vod_name: name,
+            vod_pic: normalizePic((picM && picM[1]) || ''),
+            vod_remarks: clean((remarkM && remarkM[1]) || '')
         });
     }
     return list;
@@ -724,6 +1064,11 @@ async function init(cfg) {
     playMode = 'direct';
     HOST = 'https://www.fsdm02.com';
     PARSE_HOST = 'https://ym.bjdaile.fun';
+    ocrApi = '';
+    jwtAt = 0;
+    UA = pickUa();
+    const keys = Object.keys(cookieJar);
+    for (let i = 0; i < keys.length; i++) delete cookieJar[keys[i]];
     try {
         let ext = '';
         if (cfg && typeof cfg === 'object') ext = cfg.ext || '';
@@ -736,14 +1081,25 @@ async function init(cfg) {
         if (obj) {
             if (obj.host) HOST = String(obj.host).replace(/\/+$/, '');
             if (obj.parse) PARSE_HOST = String(obj.parse).replace(/\/+$/, '');
+            if (obj.ocr) ocrApi = String(obj.ocr);
+            if (obj.cookie) {
+                if (typeof obj.cookie === 'object') {
+                    for (const k in obj.cookie) setCookiePair(k, obj.cookie[k]);
+                } else {
+                    mergeCookieString(obj.cookie);
+                }
+            }
             if (obj.mode) {
                 const m = String(obj.mode).toLowerCase();
                 if (m === 'direct' || m === 'redirect' || m === 'proxy' || m === 'stream') {
                     playMode = (m === 'proxy') ? 'redirect' : m;
                 }
             }
+        } else if (typeof ext === 'string' && ext.indexOf('=') > 0) {
+            mergeCookieString(ext);
         }
     } catch (e) {}
+    try { await ensureJwt(''); } catch (e2) {}
     return '';
 }
 
@@ -808,6 +1164,91 @@ async function category(tid, pg, filter, extend) {
     return pageResult(page, total || list.length, list);
 }
 
+function parseSuggestList(obj) {
+    if (!obj || typeof obj !== 'object') return [];
+    let arr = obj.list || obj.data || [];
+    if (!Array.isArray(arr) && arr.list) arr = arr.list;
+    if (!Array.isArray(arr)) return [];
+    const out = [];
+    const seen = {};
+    for (let i = 0; i < arr.length; i++) {
+        const it = arr[i] || {};
+        const vid = String(it.id || it.vod_id || it.en || '').replace(/\.html$/i, '');
+        const name = clean(it.name || it.vod_name || it.title || '');
+        if (!vid || !name || seen[vid]) continue;
+        seen[vid] = 1;
+        out.push({
+            vod_id: vid,
+            vod_name: name,
+            vod_pic: normalizePic(it.pic || it.vod_pic || it.img || ''),
+            vod_remarks: clean(it.en || it.remarks || it.vod_remarks || '')
+        });
+    }
+    return out;
+}
+
+function readSearchTotal(html, listLen) {
+    const tm = String(html || '').match(/mac_total["']?\s*>\s*(\d+)/i)
+        || String(html || '').match(/找到\s*<strong[^>]*>\s*(\d+)\s*<\/strong>/i);
+    if (tm) return parseInt(tm[1], 10) || listLen;
+    return listLen;
+}
+
+async function ocrB64(b64) {
+    const img = String(b64 || '').replace(/^data:image\/[^;]+;base64,/i, '').replace(/\s+/g, '');
+    if (!img) return '';
+    const urls = [];
+    if (ocrApi) urls.push(ocrApi);
+    urls.push(OCR_DEFAULT);
+    for (let i = 0; i < urls.length; i++) {
+        try {
+            const res = await req(urls[i], {
+                method: 'POST',
+                headers: { 'Content-Type': 'text/plain;charset=UTF-8', 'User-Agent': UA },
+                data: img,
+                postType: 'raw',
+                timeout: 15000
+            });
+            const body = normalizeRes(res).content || '';
+            let code = clean(body);
+            const js = parseJson(body);
+            if (js) code = clean(js.result || js.data || js.text || js.code || code);
+            code = code.replace(/[^0-9a-zA-Z]/g, '');
+            if (code.length >= 3 && code.length <= 8) return code;
+        } catch (e) {}
+    }
+    return '';
+}
+
+async function passSearchCaptcha() {
+    const imgUrl = HOST + '/index.php/verify/index.html?' + Date.now();
+    for (let n = 0; n < 3; n++) {
+        const imgRes = await rawReq(imgUrl, {
+            headers: baseHeaders(),
+            buffer: 2,
+            timeout: 15000
+        });
+        const b64 = imgRes.content || '';
+        if (!b64) continue;
+        const code = await ocrB64(b64);
+        if (!code) continue;
+        const check = HOST + '/index.php/ajax/verify_check?type=search&verify=' + encodeURIComponent(code);
+        const vres = await rawReq(check, {
+            method: 'POST',
+            headers: baseHeaders({
+                'Content-Type': 'application/x-www-form-urlencoded',
+                'X-Requested-With': 'XMLHttpRequest',
+                Accept: 'application/json, text/plain, */*'
+            }),
+            data: 'type=search&verify=' + encodeURIComponent(code),
+            postType: 'form'
+        });
+        const body = vres.content || '';
+        if (/"ok"/i.test(body) || /"code"\s*:\s*1/.test(body) || /验证成功/.test(body)) return true;
+    }
+    return false;
+}
+
 async function search(wd, quick, pg) {
     if (pg === undefined || pg === null) {
         if (typeof quick === 'number' || typeof quick === 'string') pg = quick;
@@ -819,18 +1260,40 @@ async function search(wd, quick, pg) {
     const list = [];
     let total = 0;
     try {
+        if (page === 1) {
+            const sug = await httpGet(
+                HOST + '/index.php/ajax/suggest?mid=1&wd=' + encodeURIComponent(key) + '&limit=20',
+                { Accept: 'application/json, text/plain, */*', 'X-Requested-With': 'XMLHttpRequest' }
+            );
+            if (sug.content && !sug.blocked) {
+                const arr = parseSuggestList(parseJson(sug.content));
+                for (let i = 0; i < arr.length; i++) list.push(arr[i]);
+                if (list.length) return pageResult(page, list.length, list);
+            }
+        }
         const urls = [
             searchUrl(key, page),
             HOST + '/vodsearch/' + encodeURIComponent(key) + '----------' + page + '---.html'
         ];
+        let needCaptcha = false;
         for (let i = 0; i < urls.length && !list.length; i++) {
             const r = await httpGet(urls[i], false);
             if (!r.content || r.blocked) continue;
+            if (isSearchCaptcha(r.content)) { needCaptcha = true; continue; }
             const arr = parseListHtml(r.content);
             for (let j = 0; j < arr.length; j++) list.push(arr[j]);
-            const tm = r.content.match(/mac_total["']?\s*>\s*(\d+)/i)
-                || r.content.match(/找到\s*<strong[^>]*>\s*(\d+)\s*<\/strong>/i);
-            if (tm) total = parseInt(tm[1], 10) || 0;
+            total = readSearchTotal(r.content, arr.length);
+        }
+        if (!list.length && needCaptcha) {
+            const ok = await passSearchCaptcha();
+            if (ok) {
+                const r = await httpGet(searchUrl(key, page), false);
+                if (r.content && !r.blocked && !isSearchCaptcha(r.content)) {
+                    const arr = parseListHtml(r.content);
+                    for (let j = 0; j < arr.length; j++) list.push(arr[j]);
+                    total = readSearchTotal(r.content, arr.length);
+                }
+            }
         }
         if (!total) total = list.length;
     } catch (e) {}
