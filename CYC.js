@@ -81,6 +81,14 @@ function normalizePic(src) {
     return s;
 }
 
+// 网页卡片右上角评分：保留一位小数（7.2 / 7.0），无分或 0 分不展示
+function formatScore(score) {
+    if (score === undefined || score === null || score === '') return '';
+    const n = Number(score);
+    if (isNaN(n) || n <= 0) return '';
+    return (Math.round(n * 10) / 10).toFixed(1);
+}
+
 // ==================== API 请求 ====================
 
 async function apiReq(path, params, auth, tok, post, body) {
@@ -195,13 +203,19 @@ function buildItem(v) {
     if (!v) return null;
     const vid = (v.video_id !== undefined && v.video_id !== null) ? v.video_id : v.id;
     if (vid === undefined || vid === null) return null;
-    let remark = v.remarks || '';
-    if (!remark && v.total) remark = '更新至' + v.total + '集';
+    const scoreText = formatScore(v.score);
+    // 列表海报角标跟网页一致：右上角显示评分；无评分时回退到更新备注
+    let remark = scoreText;
+    if (!remark) {
+        remark = v.remarks || '';
+        if (!remark && v.total) remark = '更新至' + v.total + '集';
+    }
     return {
         vod_id: String(vid),
         vod_name: clean(v.title || ''),
         vod_pic: normalizePic(v.cover_url || ''),
-        vod_remarks: clean(remark)
+        vod_remarks: clean(remark),
+        vod_score: scoreText
     };
 }
 
@@ -416,7 +430,7 @@ async function detail(id) {
         vod_director: joinNames(data.director),
         vod_remarks: clean(data.remarks || ''),
         vod_content: clean(data.description || ''),
-        vod_score: (data.score !== undefined && data.score !== null) ? String(data.score) : '',
+        vod_score: formatScore(data.score),
         vod_play_from: '',
         vod_play_url: ''
     };
