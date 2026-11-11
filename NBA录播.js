@@ -1,21 +1,27 @@
 /**
  * ═══════════════════════════════════════════════════════════════
- *   NBA 录播 · FongMi / 影视仓 JS 源1
+ *   NBA 录播 · FongMi / 影视仓 JS 源
  *   站点：https://www.tiyuhu.com/nbalx/
  *
- *   流程：NBA录像列表  
+ *   流程：NBA录像列表
  *         → 详情页里标签带“微博”的链接（[微博录像] / [微博-国语]）
  *         → m.weibo.cn 状态接口取 mp4 直链
  *
  *   要点：微博视频 CDN 必须带 Referer: https://weibo.com/，否则 403。
  *         play() 返回的 header 会交给播放器，无需本地代理。
  *
+ *   1080P：微博的 1080P 签名地址只对登录会话下发（weibo.com/ajax 返回的
+ *          media_info.playback_list）。在 ext 里填浏览器登录 weibo.com 后的
+ *          Cookie 即可；不填则自动退回 m.weibo.cn 的 720P：
+ *          {"cookie":"SUB=...; SUBP=...; WBPSESS=..."}
+ *
  *   范围：只处理标题含“录像 / 回放”的 NBA 录像详情页；
  *         线路只要标签带“微博”就抓（[微博录像] / [微博-国语]），
  *         [腾讯国语] / [腾讯原声] / [咪咕] 等一律不抓。
+ *         列表页简介里没有“微博”的场次（只有腾讯/咪咕）直接不显示。
  *
  *   部署：FongMi / 影视仓 → 设置 → 点播 → 添加 JS 源（type=3）
- *         api 指向本文件即可，无需 ext。
+ *         api 指向本文件即可；ext 可选，只用来填微博 Cookie 开 1080P。
  * ═══════════════════════════════════════════════════════════════
  */
 
@@ -32,6 +38,9 @@ var CATEGORY_NAME = 'NBA录像';
 var CATEGORY_PATH = '/nbalx/';
 var PAGE_SIZE = 20;
 var MAX_PAGE = 999;
+
+// 微博登录 Cookie（可选，ext.cookie），只有它才能换到 1080P 签名地址
+var WEIBO_COOKIE = '';
 
 // ==================== 工具 ====================
 
@@ -150,6 +159,11 @@ function parseList(html) {
         var vid = idm[1];
         if (seen[vid]) continue;
         if (!/录像|回放/.test(title)) continue;
+        // 列表条目的 intro 里就列出了该场可用的线路标签；
+        // 没有“微博”的说明只有腾讯/咪咕，播放器里看不了，直接不显示
+        var im = block.match(/<div[^>]*\bclass="[^"]*\bintro\b[^"]*"[^>]*>([\s\S]*?)<\/div>/i);
+        var intro = im ? clean(im[1]) : '';
+        if (intro && !/微博/.test(intro)) continue;
         seen[vid] = 1;
         var dm = block.match(/<time[^>]*\bpubdate="([^"]*)"/i);
         var date = dm ? clean(dm[1]).slice(0, 10) : '';
@@ -251,6 +265,86 @@ function parseEpisodes(html) {
 
 // ==================== 播放解析 ====================
 
+// 从一组清晰度地址里挑分辨率最高的（兼容 urls 字典结构）
+function bestMp4(urls) {
+    if (!urls) return '';
+    var best = '';
+    var bestScore = -1;
+    for (var k in urls) {
+        if (!Object.prototype.hasOwnProperty.call(urls, k)) continue;
+        var u = fixUrl(urls[k]);
+        if (!/^https?:/i.test(u)) continue;
+        var score = 0;
+        var m = u.match(/template=(\d+)x(\d+)/i);
+        if (m) score = parseInt(m[1], 10) * parseInt(m[2], 10);
+        if (/1080/i.test(k) || /mp4_1080p/i.test(u)) score += 100000000;
+        if (score >= bestScore) {
+            bestScore = score;
+            best = u;
+        }
+    }
+    return best;
+}
+
+// 登录后 weibo.com/ajax 会返回 media_info.playback_list（含 1080P 签名地址）
+function bestPlayback(status) {
+    var depth = 0;
+    while (status && depth < 5) {
+        var pi = status.page_info;
+        var media = pi && pi.media_info;
+        var list = media && media.playback_list;
+        if (list && list.length) {
+            var best = '';
+            var bestH = -1;
+            for (var i = 0; i < list.length; i++) {
+                var info = list[i] && list[i].play_info;
+                if (!info || !info.url) continue;
+                var h = parseInt(info.height, 10) || 0;
+                if (h >= bestH) {
+                    bestH = h;
+                    best = fixUrl(info.url);
+                }
+            }
+            if (best) return best;
+        }
+        // 少数视频只在 urls 里给清晰度
+        if (pi && pi.urls) {
+            var u = bestMp4(pi.urls);
+            if (u) return u;
+        }
+        status = status.retweeted_status;
+        depth++;
+    }
+    return '';
+}
+
+// 带登录 Cookie 调 weibo.com 网页接口，取最高清晰度（通常 1080P）的签名地址
+async function weiboBest(bid) {
+    if (!WEIBO_COOKIE || !bid) return '';
+    try {
+        var res = await req('https://weibo.com/ajax/statuses/show?id=' + encodeURIComponent(bid), {
+            headers: {
+                'User-Agent': UA_PC,
+                'Accept': 'application/json, text/plain, */*',
+                'Referer': 'https://weibo.com/',
+                'X-Requested-With': 'XMLHttpRequest',
+                'Cookie': WEIBO_COOKIE
+            },
+            timeout: 15000
+        });
+        if (!res || res.content === undefined || res.content === null) return '';
+        var text = res.content;
+        var obj = text;
+        if (typeof text === 'string') {
+            try { obj = JSON.parse(text); } catch (err) { return ''; }
+        }
+        if (!obj || obj.ok === -100) return '';
+        return bestPlayback(obj);
+    } catch (err) {
+        return '';
+    }
+}
+
 function findVideo(status) {
     var depth = 0;
     while (status && depth < 5) {
@@ -293,10 +387,13 @@ function init(cfg) {
         if (typeof ext === 'string' && ext.trim().charAt(0) === '{') {
             try { ext = JSON.parse(ext); } catch (e) { ext = null; }
         }
+        // 兼容整个 cfg 被序列化进来的情况：{"ext":{"cookie":"..."}}
+        if (ext && typeof ext === 'object' && ext.ext) ext = ext.ext;
         if (ext && typeof ext === 'object') {
             if (ext.host) HOST = String(ext.host).replace(/\/+$/, '');
             if (ext.ua) UA_PC = String(ext.ua);
             if (ext.uaMobile) UA_MOBILE = String(ext.uaMobile);
+            if (ext.cookie) WEIBO_COOKIE = String(ext.cookie);
         }
     } catch (e) {}
     return '';
@@ -349,18 +446,10 @@ async function detail(id) {
     var dm = html.match(/<time[^>]*\bpubdate="([^"]*)"/i);
     if (dm) date = clean(dm[1]).slice(0, 10);
 
-    var content = '';
-    var metas = html.match(/<meta\b[^>]*>/gi) || [];
-    for (var i = 0; i < metas.length; i++) {
-        if (/\bname\s*=\s*["']description["']/i.test(metas[i])) {
-            content = clean(getAttr(metas[i], 'content'));
-            break;
-        }
-    }
-
     var eps = parseEpisodes(html);
     var names = {};
     var parts = [];
+    var epNames = [];
     for (var j = 0; j < eps.length; j++) {
         var name = eps[j].name;
         if (names[name]) {
@@ -369,8 +458,12 @@ async function detail(id) {
             name = name + '(' + k + ')';
         }
         names[name] = 1;
+        epNames.push(name);
         parts.push(name + '$' + eps[j].bid);
     }
+
+    // 简介只写微博线路；站点简介里夹的腾讯/咪咕线路看不了，不显示
+    var content = epNames.length ? ('微博线路：' + epNames.join(' / ')) : '';
 
     var vod = {
         vod_id: num,
@@ -399,6 +492,13 @@ async function play(flag, id, flags) {
         var bid = extractBid(pickId(id));
         if (!bid) return fallback;
 
+        // 有登录 Cookie：直接走 weibo.com 网页接口，能拿到 1080P 签名地址
+        if (WEIBO_COOKIE) {
+            var best = await weiboBest(bid);
+            if (best) return JSON.stringify({ parse: 0, url: best, header: playHeaders() });
+        }
+
+        // 没 Cookie 或网页接口不可用：退回 m.weibo.cn 的 720P
         var api = 'https://m.weibo.cn/statuses/show?id=' + encodeURIComponent(bid);
         var content = await httpGet(api, weiboHeaders());
         if (!content) return fallback;
