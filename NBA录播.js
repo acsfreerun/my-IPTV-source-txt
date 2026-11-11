@@ -20,6 +20,10 @@
  *         [腾讯国语] / [腾讯原声] / [咪咕] 等一律不抓。
  *         列表页简介里没有“微博”的场次（只有腾讯/咪咕）直接不显示。
  *
+ *   搜索：站点 search.php / cmd.php 均 404，改用详情页里的球队标签页
+ *         （/tags-N.html）：输入“湖人”“湖人vs老鹰”“凯尔特”都能搜；
+ *         非球队关键词（NBA杯 等）回看最近 6 页列表再按标题过滤。
+ *
  *   部署：FongMi / 影视仓 → 设置 → 点播 → 添加 JS 源（type=3）
  *         api 指向本文件即可；ext 可选，只用来填微博 Cookie 开 1080P。
  * ═══════════════════════════════════════════════════════════════
@@ -41,6 +45,19 @@ var MAX_PAGE = 999;
 
 // 微博登录 Cookie（可选，ext.cookie），只有它才能换到 1080P 签名地址
 var WEIBO_COOKIE = '';
+
+// 非球队关键词在主列表里回看多少页（每页 20 条）
+var SEARCH_SCAN_PAGES = 6;
+
+// 球队标签（详情页 sidebar 的 /tags-N.html），站点搜索接口已关闭，搜索走标签页
+var TEAM_TAGS = {
+    '开拓者': 3, '公牛': 5, '火箭': 7, '勇士': 9, '国王': 11,
+    '步行者': 13, '篮网': 15, '热火': 17, '太阳': 19, '掘金': 21,
+    '鹈鹕': 25, '奇才': 27, '骑士': 28, '魔术': 30, '老鹰': 32,
+    '湖人': 34, '活塞': 35, '马刺': 36, '爵士': 38, '猛龙': 40,
+    '灰熊': 44, '76人': 45, '森林狼': 47, '雄鹿': 48, '黄蜂': 49,
+    '凯尔特人': 51, '快船': 53, '雷霆': 57, '尼克斯': 59, '独行侠': 61
+};
 
 // ==================== 工具 ====================
 
@@ -141,7 +158,7 @@ function shortName(title) {
 }
 
 // /nbalx/ 列表页混着侧栏新闻，只取 <article class="blog"> 且标题含“录像/回放”的
-function parseList(html) {
+function parseList(html, keepTitle) {
     var out = [];
     var seen = {};
     if (!html) return out;
@@ -167,12 +184,14 @@ function parseList(html) {
         seen[vid] = 1;
         var dm = block.match(/<time[^>]*\bpubdate="([^"]*)"/i);
         var date = dm ? clean(dm[1]).slice(0, 10) : '';
-        out.push({
+        var item = {
             vod_id: vid,
             vod_name: shortName(title) || title,
             vod_pic: '',
             vod_remarks: date ? date.slice(5) : '录像'
-        });
+        };
+        if (keepTitle) item.title = title;
+        out.push(item);
     }
     return out;
 }
@@ -187,6 +206,47 @@ function parsePageCount(html, page) {
         if (!isNaN(n) && n > max && n <= MAX_PAGE) max = n;
     }
     return max;
+}
+
+function tagPageCount(html, tag) {
+    var max = 1;
+    if (!html) return max;
+    var re = new RegExp('tags-' + tag + '_(\\d+)\\.html', 'gi');
+    var m;
+    while ((m = re.exec(html)) !== null) {
+        var n = parseInt(m[1], 10);
+        if (!isNaN(n) && n > max) max = n;
+    }
+    return max;
+}
+
+// 从搜索词里识别球队：湖人 / 湖人vs老鹰 / 湖人 老鹰 / 凯尔特（简称）
+function searchTeams(keyword) {
+    var t = clean(keyword).replace(/\s+/g, '');
+    t = t.replace(/^NBA/i, '').replace(/录像|回放|完整版|全场|视频|集锦/g, '');
+    var hits = [];
+    for (var name in TEAM_TAGS) {
+        if (!Object.prototype.hasOwnProperty.call(TEAM_TAGS, name)) continue;
+        var i = t.indexOf(name);
+        if (i < 0 && t.length >= 2) i = name.indexOf(t);
+        if (i >= 0) hits.push({ name: name, idx: i, tag: TEAM_TAGS[name] });
+    }
+    hits.sort(function (a, b) { return a.idx - b.idx; });
+    return hits;
+}
+
+// 关键词里除球队名以外的限定词（湖人 季后赛 → 季后赛；湖人vs老鹰 → 空）
+function searchLeftover(keyword, teams) {
+    var t = clean(keyword).replace(/\s+/g, '');
+    t = t.replace(/^NBA/i, '').replace(/录像|回放|完整版|全场|视频|集锦/g, '');
+    t = t.replace(/vs|VS|Vs|vS|对阵/g, '');
+    for (var i = 0; i < teams.length; i++) t = t.split(teams[i].name).join('');
+    return t;
+}
+
+function stripTitle(list) {
+    for (var i = 0; i < list.length; i++) delete list[i].title;
+    return list;
 }
 
 async function fetchListPage(page) {
@@ -482,8 +542,66 @@ async function detail(id) {
 }
 
 async function search(wd, quick, pg) {
-    // 站点没有可用的搜索接口（search.php / cmd.php 均 404）
-    return JSON.stringify({ page: 1, pagecount: 1, limit: PAGE_SIZE, total: 0, list: [] });
+    // 兼容 search(wd, pg) 与 search(wd, quick, pg)
+    if (pg === undefined || pg === null) {
+        if (typeof quick === 'number' || typeof quick === 'string') pg = quick;
+    }
+    var page = parseInt(pg, 10);
+    if (!page || page < 1) page = 1;
+
+    var key = clean(wd);
+    var empty = { page: page, pagecount: 1, limit: PAGE_SIZE, total: 0, list: [] };
+    if (!key) return JSON.stringify(empty);
+
+    var teams = searchTeams(key);
+    var list = [];
+    var pagecount = 1;
+
+    if (teams.length) {
+        // 站点搜索接口 404，改用球队标签页（tags-N.html / tags-N_2.html …）
+        var tid = teams[0].tag;
+        var url = HOST + '/tags-' + tid + (page > 1 ? '_' + page : '') + '.html';
+        var html = await httpGet(url, siteHeaders(HOST + CATEGORY_PATH));
+        list = parseList(html, true);
+        pagecount = tagPageCount(html, tid);
+
+        var extra = searchLeftover(key, teams);
+        list = list.filter(function (v) {
+            for (var i = 0; i < teams.length; i++) {
+                if (v.title.indexOf(teams[i].name) < 0) return false;
+            }
+            if (extra.length >= 2 && v.title.indexOf(extra) < 0) return false;
+            return true;
+        });
+    } else {
+        // 不是球队名（NBA杯 等）：回看最近若干页，按标题过滤
+        var pages = [];
+        for (var p = 1; p <= SEARCH_SCAN_PAGES; p++) pages.push(p);
+        var htmls = await Promise.all(pages.map(function (n) {
+            return httpGet(HOST + CATEGORY_PATH + (n > 1 ? n + '/' : ''), siteHeaders(HOST + CATEGORY_PATH));
+        }));
+        var seenIds = {};
+        for (var h = 0; h < htmls.length; h++) {
+            var items = parseList(htmls[h], true);
+            for (var j = 0; j < items.length; j++) {
+                var v = items[j];
+                if (seenIds[v.vod_id]) continue;
+                if (v.title.indexOf(key) < 0) continue;
+                seenIds[v.vod_id] = 1;
+                list.push(v);
+            }
+        }
+        pagecount = 1;
+    }
+
+    stripTitle(list);
+    return JSON.stringify({
+        page: page,
+        pagecount: pagecount,
+        limit: PAGE_SIZE,
+        total: pagecount * PAGE_SIZE,
+        list: list
+    });
 }
 
 async function play(flag, id, flags) {
