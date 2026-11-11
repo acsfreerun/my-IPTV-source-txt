@@ -43,8 +43,8 @@ var CATEGORY_PATH = '/nbalx/';
 var PAGE_SIZE = 20;
 var MAX_PAGE = 999;
 
-// 微博登录 Cookie（可选，ext.cookie），只有它才能换到 1080P 签名地址
-var WEIBO_COOKIE = '';
+// 微博登录 Cookie（也可用 ext.cookie 覆盖），只有它才能换到 1080P 签名地址
+var WEIBO_COOKIE = 'SUB=_2AkMdn5p2f8NxqwFRmvwVymPgbIR0yQjEieKrw2utJRMxHRl-yT9xqmAgtRB6Nh-0mXGIyUKm-3oqVpHpZBRDWV2mcSKz; SUBP=0033WrSXqPxfM72-Ws9jqgMF55529P9D9WhIqoGjLA0kc3I2VvxwIcAK; XSRF-TOKEN=jEqaOnwq1OEVQgv5ItDsxq1q; WBPSESS=cbjWrs_UvapT2Pg_hlK_fB84JJ28VC7VyfnXSXAjhbdp1kfSumWS8-5FwNTv2jhREL8022BITzr9t9inH2jSIHDecWYpShay2ka3EO0OYW_54OSdtvJVMJfseWWp8XonuLyogk7wYDgMiR-4Juwu1HayCu-DGwVjONkrOIh4-Is=; PC_TOKEN=c277ea0f3c';
 
 // 非球队关键词在主列表里回看多少页（每页 20 条）
 var SEARCH_SCAN_PAGES = 6;
